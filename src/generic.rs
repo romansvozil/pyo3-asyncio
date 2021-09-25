@@ -1,5 +1,6 @@
 use std::{future::Future, pin::Pin};
 
+use futures::channel::oneshot;
 use pyo3::{prelude::*, PyNativeType};
 
 #[allow(deprecated)]
@@ -451,7 +452,16 @@ where
     R: Runtime,
     F: Future<Output = PyResult<PyObject>> + Send + 'static,
 {
+    use crate::PyTaskCompleter;
+    use futures::future::FutureExt;
+    use futures::select;
+    use futures::pin_mut;
+
+    let (tx, mut rx) = oneshot::channel();
+    let on_complete = PyTaskCompleter { tx: Some(tx) };
+    
     let future_rx = create_future(event_loop)?;
+    future_rx.call_method1("add_done_callback", (on_complete,))?;
     let future_tx1 = PyObject::from(future_rx);
     let future_tx2 = future_tx1.clone();
 
@@ -461,19 +471,28 @@ where
         let event_loop2 = event_loop.clone();
 
         if let Err(e) = R::spawn(async move {
-            let result = R::scope(event_loop2.clone(), fut).await;
+            let f = async move {
+                let result = R::scope(event_loop2.clone(), fut).await;
 
-            Python::with_gil(move |py| {
-                if cancelled(future_tx1.as_ref(py))
-                    .map_err(dump_err(py))
-                    .unwrap_or(false)
-                {
-                    return;
-                }
+                Python::with_gil(move |py| {
+                    if cancelled(future_tx1.as_ref(py))
+                        .map_err(dump_err(py))
+                        .unwrap_or(false)
+                    {
+                        return;
+                    }
 
-                let _ = set_result(event_loop2.as_ref(py), future_tx1.as_ref(py), result)
-                    .map_err(dump_err(py));
-            });
+                    let _ = set_result(event_loop2.as_ref(py), future_tx1.as_ref(py), result)
+                        .map_err(dump_err(py));
+                });
+            }.fuse();
+
+            pin_mut!(f);
+
+            select! {
+                _ = f  => {},
+                _ = rx => {}
+            }
         })
         .await
         {
